@@ -1,0 +1,654 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import os
+import threading
+import re
+
+def detect_file_type(lines):
+    """Nhận diện file bằng nội dung"""
+    for l in lines[:50]:
+        content = l.strip().upper()
+        if '**' in content or "*STEP" in content or "*STATIC" in content or "*CLOAD" in content:
+            return "abaqus"
+        if content.startswith("$") or 'NASTRAN' in content or "BEGIN BULK" in content or "FORCE*" in content or "MOMENT*" in content:
+            return "nastran"
+    return "unknown"
+
+def process_abaqus_line(line, multiplier):
+    """Xử lý dòng ABAQUS: thay đổi giá trị thứ 3"""
+    line = line.rstrip('\n')
+    
+    # Bỏ qua các dòng comment
+    if line.startswith('*') or line.startswith('**'):
+        return line + '\n'
+    
+    # Tách các phần của dòng
+    parts = [p.strip() for p in line.split(',')]
+    
+    # Kiểm tra xem có đúng format không (node_id, dof, value)
+    if len(parts) >= 3:
+        try:
+            # Lấy giá trị thứ 3
+            value = float(parts[2])
+            # Nhân với hệ số
+            new_value = value * multiplier
+            # Thay thế giá trị thứ 3
+            parts[2] = f"{new_value:.5e}"
+            # Ghép lại dòng
+            return ','.join(parts) + '\n'
+        except ValueError:
+            pass
+    
+    return line + '\n'
+
+def process_nastran_lines(lines, multiplier):
+    """
+    Xử lý dòng NASTRAN: sửa 3 giá trị số đầu tiên trên dòng * tiếp sau FORCE*/MOMENT*
+    """
+    result = []
+    i = 0
+    
+    while i < len(lines):
+        line = lines[i]
+        line_upper = line.strip().upper()
+        
+        # Kiểm tra xem là dòng FORCE* hoặc MOMENT*
+        if line_upper.startswith("FORCE*") or line_upper.startswith("MOMENT*"):
+            result.append(line)
+            i += 1
+            
+            # Dòng tiếp theo là dòng dữ liệu (bắt đầu bằng *)
+            if i < len(lines):
+                data_line = lines[i].rstrip('\n')
+                
+                # Bỏ dấu + ở cuối nếu có
+                if data_line.endswith('+'):
+                    data_line = data_line[:-1]
+                
+                # Trích xuất các giá trị số
+                # Định dạng Nastran: các số ngăn cách bằng khoảng trắng
+                parts = data_line.split()
+                new_parts = []
+                float_count = 0
+                
+                for part in parts:
+                    try:
+                        value = float(part)
+                        float_count += 1
+                        
+                        # Chỉ nhân 3 giá trị đầu tiên
+                        if float_count <= 3:
+                            value = value * multiplier
+                        
+                        # Format lại với đủ độ chính xác
+                        new_parts.append(f"{value:.8e}")
+                    except ValueError:
+                        new_parts.append(part)
+                
+                # Tái lập dòng dữ liệu
+                new_data_line = " ".join(new_parts)
+                
+                # Thêm dấu + nếu cần (nếu dòng tiếp theo tiếp tục)
+                if i + 1 < len(lines) and lines[i + 1].strip().startswith("*"):
+                    new_data_line += " +"
+                
+                result.append(new_data_line + '\n')
+                i += 1
+                continue
+        
+        result.append(line)
+        i += 1
+    
+    return result
+
+class ABQBatchModifier:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("ABAQUS/NASTRAN Batch Load Data Modifier")
+        self.root.geometry("1150x800")
+        self.root.resizable(True, True)
+        
+        self.file_list = []
+        self.processing = False
+        self.selected_index = None
+        
+        # Frame chính
+        main_frame = tk.Frame(root, bg="#f0f0f0", padx=15, pady=15)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Tiêu đề
+        title_label = tk.Label(
+            main_frame,
+            text="ABAQUS / NASTRAN Batch Load Data Modifier",
+            font=("Arial", 16, "bold"),
+            bg="#f0f0f0"
+        )
+        title_label.pack(pady=10)
+        
+        # ===== Frame 1: Chọn File =====
+        file_select_frame = tk.LabelFrame(
+            main_frame,
+            text="1. Chọn File TXT",
+            font=("Arial", 11, "bold"),
+            bg="#f0f0f0",
+            padx=10,
+            pady=10
+        )
+        file_select_frame.pack(fill=tk.X, pady=10)
+        
+        button_subframe = tk.Frame(file_select_frame, bg="#f0f0f0")
+        button_subframe.pack(fill=tk.X)
+        
+        select_btn = tk.Button(
+            button_subframe,
+            text="➕ Thêm File",
+            command=self.add_file,
+            font=("Arial", 10),
+            bg="#4CAF50",
+            fg="white",
+            padx=15,
+            pady=8,
+            cursor="hand2"
+        )
+        select_btn.pack(side=tk.LEFT, padx=5)
+        
+        select_folder_btn = tk.Button(
+            button_subframe,
+            text="📂 Thêm Thư Mục",
+            command=self.add_folder,
+            font=("Arial", 10),
+            bg="#2196F3",
+            fg="white",
+            padx=15,
+            pady=8,
+            cursor="hand2"
+        )
+        select_folder_btn.pack(side=tk.LEFT, padx=5)
+        
+        delete_btn = tk.Button(
+            button_subframe,
+            text="❌ Xóa File Chọn",
+            command=self.delete_selected_file,
+            font=("Arial", 10),
+            bg="#FF5722",
+            fg="white",
+            padx=15,
+            pady=8,
+            cursor="hand2"
+        )
+        delete_btn.pack(side=tk.LEFT, padx=5)
+        
+        clear_btn = tk.Button(
+            button_subframe,
+            text="🗑️ Xóa Tất Cả",
+            command=self.clear_files,
+            font=("Arial", 10),
+            bg="#f44336",
+            fg="white",
+            padx=15,
+            pady=8,
+            cursor="hand2"
+        )
+        clear_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Danh sách file
+        list_label = tk.Label(
+            file_select_frame,
+            text="Danh sách file đã chọn (click vào để chọn, rồi nhấn ❌ để xóa):",
+            font=("Arial", 10),
+            bg="#f0f0f0"
+        )
+        list_label.pack(anchor=tk.W, pady=(10, 5))
+        
+        # Frame cho Treeview
+        tree_frame = tk.Frame(file_select_frame, bg="white", relief=tk.SUNKEN, bd=1)
+        tree_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # Scrollbar
+        scrollbar = ttk.Scrollbar(tree_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Treeview với 4 cột: STT, Kiểu, Tên File, Đường Dẫn
+        self.file_tree = ttk.Treeview(
+            tree_frame,
+            columns=("STT", "Kiểu", "Tên File", "Đường Dẫn"),
+            height=8,
+            yscrollcommand=scrollbar.set,
+            show="headings"
+        )
+        scrollbar.config(command=self.file_tree.yview)
+        
+        # Định nghĩa các cột
+        self.file_tree.column("STT", width=50, anchor="center")
+        self.file_tree.column("Kiểu", width=90, anchor="center")
+        self.file_tree.column("Tên File", width=300)
+        self.file_tree.column("Đường Dẫn", width=500)
+        
+        # Định nghĩa tiêu đề
+        self.file_tree.heading("STT", text="STT")
+        self.file_tree.heading("Kiểu", text="Kiểu")
+        self.file_tree.heading("Tên File", text="Tên File")
+        self.file_tree.heading("Đường Dẫn", text="Đường Dẫn")
+        
+        # Bind sự kiện <<TreeviewSelect>> thay vì <Button-1>
+        self.file_tree.bind('<<TreeviewSelect>>', self.on_tree_select)
+        
+        self.file_tree.pack(fill=tk.BOTH, expand=True)
+        
+        # ===== Frame 2: Cấu hình chỉnh sửa =====
+        config_frame = tk.LabelFrame(
+            main_frame,
+            text="2. Cấu Hình Chỉnh Sửa",
+            font=("Arial", 11, "bold"),
+            bg="#f0f0f0",
+            padx=10,
+            pady=10
+        )
+        config_frame.pack(fill=tk.X, pady=10)
+        
+        # Hệ số nhân
+        multiplier_frame = tk.Frame(config_frame, bg="#f0f0f0")
+        multiplier_frame.pack(fill=tk.X, pady=5)
+        
+        multiplier_label = tk.Label(
+            multiplier_frame,
+            text="Hệ số nhân cho giá trị tải:",
+            font=("Arial", 10),
+            bg="#f0f0f0"
+        )
+        multiplier_label.pack(side=tk.LEFT, padx=5)
+        
+        self.multiplier_entry = tk.Entry(
+            multiplier_frame,
+            font=("Arial", 10),
+            width=15
+        )
+        self.multiplier_entry.pack(side=tk.LEFT, padx=5)
+        self.multiplier_entry.insert(0, "1.0")
+        
+        # Tùy chọn đầu ra
+        output_frame = tk.Frame(config_frame, bg="#f0f0f0")
+        output_frame.pack(fill=tk.X, pady=5)
+        
+        output_label = tk.Label(
+            output_frame,
+            text="Vị trí lưu file:",
+            font=("Arial", 10),
+            bg="#f0f0f0"
+        )
+        output_label.pack(side=tk.LEFT, padx=5)
+        
+        self.output_var = tk.StringVar(value="same")
+        
+        same_radio = tk.Radiobutton(
+            output_frame,
+            text="Cùng thư mục với file gốc",
+            variable=self.output_var,
+            value="same",
+            font=("Arial", 10),
+            bg="#f0f0f0"
+        )
+        same_radio.pack(side=tk.LEFT, padx=5)
+        
+        custom_radio = tk.Radiobutton(
+            output_frame,
+            text="Thư mục tùy chọn",
+            variable=self.output_var,
+            value="custom",
+            font=("Arial", 10),
+            bg="#f0f0f0"
+        )
+        custom_radio.pack(side=tk.LEFT, padx=5)
+        
+        # Frame cho thư mục đầu ra
+        output_path_frame = tk.Frame(config_frame, bg="#f0f0f0")
+        output_path_frame.pack(fill=tk.X, pady=5)
+        
+        output_path_label = tk.Label(
+            output_path_frame,
+            text="Thư mục đầu ra:",
+            font=("Arial", 10),
+            bg="#f0f0f0"
+        )
+        output_path_label.pack(side=tk.LEFT, padx=5)
+        
+        self.output_path_display = tk.Label(
+            output_path_frame,
+            text="Chưa chọn",
+            font=("Arial", 9),
+            bg="white",
+            fg="#2196F3",
+            relief=tk.SUNKEN,
+            padx=10,
+            pady=5
+        )
+        self.output_path_display.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        browse_btn = tk.Button(
+            output_path_frame,
+            text="Duyệt...",
+            command=self.select_output_folder,
+            font=("Arial", 9),
+            bg="#FF9800",
+            fg="white",
+            padx=10,
+            pady=5
+        )
+        browse_btn.pack(side=tk.LEFT, padx=5)
+        
+        # ===== Frame 3: Xử lý =====
+        process_frame = tk.LabelFrame(
+            main_frame,
+            text="3. Xử Lý",
+            font=("Arial", 11, "bold"),
+            bg="#f0f0f0",
+            padx=10,
+            pady=10
+        )
+        process_frame.pack(fill=tk.X, pady=10)
+        
+        process_btn_frame = tk.Frame(process_frame, bg="#f0f0f0")
+        process_btn_frame.pack(fill=tk.X)
+        
+        self.process_btn = tk.Button(
+            process_btn_frame,
+            text="▶ Bắt Đầu Xử Lý",
+            command=self.process_files,
+            font=("Arial", 11, "bold"),
+            bg="#4CAF50",
+            fg="white",
+            padx=20,
+            pady=10,
+            cursor="hand2"
+        )
+        self.process_btn.pack(side=tk.LEFT, padx=5)
+        
+        # ===== Frame 4: Tiến trình =====
+        progress_frame = tk.LabelFrame(
+            main_frame,
+            text="4. Tiến Trình",
+            font=("Arial", 11, "bold"),
+            bg="#f0f0f0",
+            padx=10,
+            pady=10
+        )
+        progress_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        
+        # Progress bar
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(
+            progress_frame,
+            variable=self.progress_var,
+            maximum=100,
+            length=400,
+            mode='determinate'
+        )
+        self.progress_bar.pack(fill=tk.X, pady=5)
+        
+        # Status label
+        self.status_label = tk.Label(
+            progress_frame,
+            text="Sẵn sàng",
+            font=("Arial", 10),
+            bg="#f0f0f0",
+            fg="#4CAF50"
+        )
+        self.status_label.pack(anchor=tk.W, pady=5)
+        
+        # Log text
+        log_label = tk.Label(
+            progress_frame,
+            text="Nhật ký xử lý:",
+            font=("Arial", 9),
+            bg="#f0f0f0"
+        )
+        log_label.pack(anchor=tk.W)
+        
+        log_frame = tk.Frame(progress_frame, bg="white", relief=tk.SUNKEN, bd=1)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        log_scrollbar = ttk.Scrollbar(log_frame)
+        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.log_text = tk.Text(
+            log_frame,
+            height=8,
+            font=("Courier", 9),
+            yscrollcommand=log_scrollbar.set
+        )
+        log_scrollbar.config(command=self.log_text.yview)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+        
+        # Output folder
+        self.output_path = ""
+    
+    def on_tree_select(self, event):
+        """Xử lý sự kiện chọn item trong Treeview (dùng <<TreeviewSelect>>)"""
+        selection = self.file_tree.selection()
+        if selection:
+            item = selection[0]
+            # Lấy index từ giá trị STT
+            values = self.file_tree.item(item, 'values')
+            try:
+                self.selected_index = int(values[0]) - 1  # STT bắt đầu từ 1
+            except (ValueError, IndexError):
+                self.selected_index = None
+        else:
+            self.selected_index = None
+    
+    def add_file(self):
+        """Thêm file"""
+        file_paths = filedialog.askopenfilenames(
+            title="Chọn file TXT",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        
+        for file_path in file_paths:
+            if file_path not in self.file_list:
+                self.file_list.append(file_path)
+        
+        self.update_file_tree()
+    
+    def add_folder(self):
+        """Thêm toàn bộ file từ thư mục"""
+        folder_path = filedialog.askdirectory(title="Chọn thư mục")
+        
+        if folder_path:
+            for file in os.listdir(folder_path):
+                if file.endswith('.txt'):
+                    file_path = os.path.join(folder_path, file)
+                    if file_path not in self.file_list:
+                        self.file_list.append(file_path)
+            
+            self.update_file_tree()
+    
+    def delete_selected_file(self):
+        """Xóa file được chọn"""
+        if self.selected_index is None:
+            messagebox.showwarning("Cảnh báo", "Vui lòng chọn file muốn xóa!")
+            return
+        
+        try:
+            file_path = self.file_list[self.selected_index]
+            file_name = os.path.basename(file_path)
+            
+            if messagebox.askyesno("Xác nhận", f"Bạn có chắc chắn muốn xóa file này?\n\n{file_name}"):
+                self.file_list.pop(self.selected_index)
+                self.selected_index = None
+                self.update_file_tree()
+                messagebox.showinfo("Thành công", f"Đã xóa: {file_name}")
+        except Exception as e:
+            messagebox.showerror("Lỗi", f"Không thể xóa file: {str(e)}")
+    
+    def clear_files(self):
+        """Xóa tất cả file"""
+        if self.file_list and messagebox.askyesno("Xác nhận", "Bạn có chắc chắn muốn xóa tất cả file?"):
+            self.file_list.clear()
+            self.selected_index = None
+            self.update_file_tree()
+            messagebox.showinfo("Thành công", "Đã xóa tất cả file khỏi danh sách!")
+    
+    def update_file_tree(self):
+        """Cập nhật danh sách file trên giao diện"""
+        # Xóa tất cả item cũ
+        for item in self.file_tree.get_children():
+            self.file_tree.delete(item)
+        
+        # Thêm item mới với đánh số thứ tự
+        for i, file_path in enumerate(self.file_list):
+            file_name = os.path.basename(file_path)
+            stt = i + 1  # Đánh số từ 1
+            
+            # Phân biệt kiểu file dựa trên nội dung
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    first_lines = [f.readline() for _ in range(30)]
+                
+                file_type = detect_file_type(first_lines)
+                fmt = "ABAQUS" if file_type == "abaqus" else ("NASTRAN" if file_type == "nastran" else "Unknown")
+            except Exception:
+                fmt = "Unknown"
+            
+            # Thêm row vào Treeview
+            self.file_tree.insert(
+                "",
+                tk.END,
+                values=(stt, fmt, file_name, file_path)
+            )
+    
+    def select_output_folder(self):
+        """Chọn thư mục đầu ra"""
+        folder_path = filedialog.askdirectory(title="Chọn thư mục lưu file")
+        
+        if folder_path:
+            self.output_path = folder_path
+            self.output_path_display.config(text=folder_path)
+    
+    def process_file(self, file_path, multiplier, output_dir):
+        """Xử lý một file"""
+        try:
+            # Đọc file gốc
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            # Nhận diện kiểu file
+            file_type = detect_file_type(lines)
+            
+            # Xử lý theo kiểu file
+            if file_type == "abaqus":
+                modified_lines = [process_abaqus_line(line, multiplier) for line in lines]
+            elif file_type == "nastran":
+                modified_lines = process_nastran_lines(lines, multiplier)
+            else:
+                return False, "Không nhận diện được format", "unknown"
+            
+            # Tạo tên file mới
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
+            new_file_name = base_name + "_modified.txt"
+            new_file_path = os.path.join(output_dir, new_file_name)
+            
+            # Ghi file mới
+            with open(new_file_path, 'w', encoding='utf-8') as f:
+                f.writelines(modified_lines)
+            
+            return True, new_file_path, file_type
+        except Exception as e:
+            return False, str(e), "unknown"
+    
+    def process_files(self):
+        """Xử lý tất cả file"""
+        if not self.file_list:
+            messagebox.showwarning("Cảnh báo", "Vui lòng chọn ít nhất một file!")
+            return
+        
+        try:
+            multiplier = float(self.multiplier_entry.get())
+        except ValueError:
+            messagebox.showerror("Lỗi", "Hệ số nhân phải là một số thực!")
+            return
+        
+        # Xác định thư mục đầu ra
+        if self.output_var.get() == "custom":
+            if not self.output_path:
+                messagebox.showwarning("Cảnh báo", "Vui lòng chọn thư mục đầu ra!")
+                return
+            output_dir = self.output_path
+        else:
+            output_dir = None
+        
+        # Chạy xử lý trên thread riêng để không làm đơ giao diện
+        thread = threading.Thread(
+            target=self._process_files_thread,
+            args=(multiplier, output_dir)
+        )
+        thread.start()
+    
+    def _process_files_thread(self, multiplier, output_dir):
+        """Xử lý file trên thread riêng"""
+        self.processing = True
+        self.process_btn.config(state=tk.DISABLED)
+        self.log_text.delete(1.0, tk.END)
+        
+        total_files = len(self.file_list)
+        successful = 0
+        failed = 0
+        
+        self.log_message(f"Bắt đầu xử lý {total_files} file với hệ số nhân: {multiplier}\n")
+        
+        for i, file_path in enumerate(self.file_list, 1):
+            # Cập nhật tiến trình
+            progress = (i / total_files) * 100
+            self.progress_var.set(progress)
+            
+            # Xác định thư mục đầu ra cho file này
+            if output_dir is None:
+                file_output_dir = os.path.dirname(file_path)
+            else:
+                file_output_dir = output_dir
+            
+            # Xử lý file
+            file_name = os.path.basename(file_path)
+            self.status_label.config(
+                text=f"Đang xử lý ({i}/{total_files}): {file_name}",
+                fg="#FF9800"
+            )
+            self.root.update()
+            
+            success, result, file_type = self.process_file(file_path, multiplier, file_output_dir)
+            
+            fmt = "ABAQUS" if file_type == "abaqus" else ("NASTRAN" if file_type == "nastran" else "???")
+            
+            if success:
+                self.log_message(f"✓ [{i}/{total_files}] [{fmt}] {file_name} -> {os.path.basename(result)}")
+                successful += 1
+            else:
+                self.log_message(f"✗ [{i}/{total_files}] {file_name} (Lỗi: {result})")
+                failed += 1
+        
+        # Hoàn thành
+        self.progress_var.set(100)
+        self.log_message(f"\n{'='*70}")
+        self.log_message(f"Hoàn thành! Thành công: {successful}, Thất bại: {failed}")
+        self.status_label.config(
+            text=f"Hoàn thành! ({successful} thành công, {failed} thất bại)",
+            fg="#4CAF50"
+        )
+        
+        self.process_btn.config(state=tk.NORMAL)
+        self.processing = False
+        
+        messagebox.showinfo(
+            "Hoàn thành",
+            f"Xử lý hoàn thành!\n\nThành công: {successful}\nThất bại: {failed}"
+        )
+    
+    def log_message(self, message):
+        """Ghi log message"""
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
+        self.root.update()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ABQBatchModifier(root)
+    root.mainloop()
